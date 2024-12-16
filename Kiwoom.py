@@ -8,7 +8,7 @@ last edit: 2017. 02. 05
 """
 
 
-import sys
+import sys, time
 import logging
 import logging.config
 from PyQt5.QAxContainer import QAxWidget
@@ -54,7 +54,7 @@ class Kiwoom(QAxWidget):
 
         # 보유종목 정보
         self.opw00018Data = {'accountEvaluation': [], 'stocks': []}
-
+        #self.opt20001Data = ["0"] * 6
         # signal & slot
         self.OnEventConnect.connect(self.eventConnect)
         self.OnReceiveTrData.connect(self.receiveTrData)
@@ -68,7 +68,11 @@ class Kiwoom(QAxWidget):
         # 로깅용 설정파일
         logging.config.fileConfig('logging.conf')
         self.log = logging.getLogger('Kiwoom')
+        # 로그 레벨 변경
+        #self.log.setLevel(logging.INFO)  # 또는 logging.WARNING
 
+        # 조건식 종목 리스트
+        self.condition_codes = []
     ###############################################################
     # 로깅용 메서드 정의                                               #
     ###############################################################
@@ -149,7 +153,7 @@ class Kiwoom(QAxWidget):
         :param inquiry: string - 조회('0': 남은 데이터 없음, '2': 남은 데이터 있음)
         """
 
-        print("receiveTrData 실행: ", screenNo, requestName, trCode, recordName, inquiry)
+        # print("receiveTrData 실행: ", screenNo, requestName, trCode, recordName, inquiry)
 
         # 주문번호와 주문루프
         self.orderNo = self.commGetData(trCode, "", requestName, 0, "주문번호")
@@ -196,7 +200,7 @@ class Kiwoom(QAxWidget):
                 close = self.commGetData(trCode, "", requestName, i, "현재가")
                 print(date, ": ", open, ' ', high, ' ', low, ' ', close)
             """
-
+        
         elif requestName == "예수금상세현황요청":
             deposit = self.commGetData(trCode, "", requestName, 0, "d+2추정예수금")
             deposit = self.changeFormat(deposit)
@@ -221,7 +225,7 @@ class Kiwoom(QAxWidget):
 
             # 보유 종목 정보
             cnt = self.getRepeatCnt(trCode, requestName)
-            keyList = ["종목명", "보유수량", "매입가", "현재가", "평가손익", "수익률(%)"]
+            keyList = ["종목번호", "종목명", "주문가능수량", "매입가", "현재가", "평가손익", "수익률(%)"]
 
             for i in range(cnt):
                 stock = []
@@ -231,8 +235,12 @@ class Kiwoom(QAxWidget):
 
                     if key.startswith("수익률"):
                         value = self.changeFormat(value, 2)
+                    elif key == "종목번호":
+                        value = str(value[-6:])  # 종목번호의 마지막 6자리만 추출
                     elif key != "종목명":
                         value = self.changeFormat(value)
+                    
+
 
                     stock.append(value)
 
@@ -257,8 +265,23 @@ class Kiwoom(QAxWidget):
         """
 
         try:
-            self.log.debug("[receiveRealData]")
-            self.log.debug("({})".format(realType))
+            #self.log.debug("[receiveRealData]")
+            #self.log.debug("({})".format(realType))
+
+            if realType == "업종지수":
+                # 업종코드: 001:코스피, 101:코스닥, 201:코스피200
+                current_price = self.getCommRealData(code, 10)  # 현재가
+                up_down_rate = self.getCommRealData(code, 12)  # 등락율
+                
+                if code == "001":  # 코스피
+                    self.opt20001Data[0] = current_price
+                    self.opt20001Data[1] = up_down_rate
+                elif code == "101":  # 코스닥
+                    self.opt20001Data[2] = current_price
+                    self.opt20001Data[3] = up_down_rate
+                elif code == "201":  # 코스피200
+                    self.opt20001Data[4] = current_price
+                    self.opt20001Data[5] = up_down_rate
 
             if realType not in RealType.REALTYPE:
                 return
@@ -697,7 +720,8 @@ class Kiwoom(QAxWidget):
 
             print(codeList)
             print("종목개수: ", len(codeList))
-
+            self.condition_codes = codeList
+            print(self.condition_codes)
         finally:
             self.conditionLoop.exit()
 
@@ -876,7 +900,56 @@ class Kiwoom(QAxWidget):
         cmd = 'GetChejanData("%s")' % fid
         data = self.dynamicCall(cmd)
         return data
+    
+    def get_current_price(self, code):
+        """
+        종목의 현재가를 조회합니다.
+        
+        Args:
+            code (str): 종목코드
+            
+        Returns:
+            int: 현재가 (실패시 0 반환)
+        """
+        try:
+            # 실시간 조회 요청
+            self.setInputValue("종목코드", code)
+            self.commRqData("주식기본정보", "opt10001", 0, "0101")
+            
+            # 데이터 수신 대기
+            timeout = 3  # 3초 타임아웃
+            start_time = time.time()
+            while not hasattr(self, 'currentPrice') or self.currentPrice == "":
+                time.sleep(0.1)
+                if time.time() - start_time > timeout:
+                    print(f"시간 초과: {code}")
+                    return 0
+                    
+            current_price = self.currentPrice
+            self.currentPrice = ""  # 다음 요청을 위해 초기화
+            
+            return int(current_price)
+            
+        except Exception as e:
+            print(f"현재가 조회 실패 ({code}): {str(e)}")
+            return 0
 
+    def get_sellable_qty(self, code, account):
+        """매도가능수량 조회"""
+        try:
+            self.setInputValue("계좌번호", account)
+            self.setInputValue("비밀번호", "0000")
+            self.setInputValue("종목코드", code)
+            self.commRqData("opw00018", "opw00018", 0, "0101")
+            
+            # opw00018 TR에서 매도가능수량을 찾아 반환
+            for stock in self.opw00018Data['stocks']:
+                if stock[0] == code:  # 종목코드 비교
+                    return int(stock[2])  # 매도가능수량 인덱스
+            return 0
+        except Exception:
+            return 0
+        
     ###############################################################
     # 기타 메서드 정의                                                #
     ###############################################################
@@ -939,26 +1012,52 @@ class Kiwoom(QAxWidget):
         name = self.dynamicCall(cmd)
         return name
 
+    # def changeFormat(self, data, percent=0):
+
+    #     if percent == 0:
+    #         d = int(data)
+    #         formatData = '{:-,d}'.format(d)
+
+    #     elif percent == 1:
+    #         f = int(data) / 100
+    #         formatData = '{:-,.2f}'.format(f)
+
+    #     elif percent == 2:
+    #         f = float(data)
+    #         formatData = '{:-,.2f}'.format(f)
+
+    #     return formatData
+
+
     def changeFormat(self, data, percent=0):
+        try:
+            # 데이터 유효성 확인 및 포맷팅
+            if percent == 0:
+                d = int(float(data))  # 데이터가 소수점 포함 가능성이 있으므로 float로 변환 후 int 처리
+                formatData = '{:-,d}'.format(d)
 
-        if percent == 0:
-            d = int(data)
-            formatData = '{:-,d}'.format(d)
+            elif percent == 1:
+                f = float(data) / 100  # float로 변환 후 퍼센트 처리
+                formatData = '{:-,.2f}'.format(f)
 
-        elif percent == 1:
-            f = int(data) / 100
-            formatData = '{:-,.2f}'.format(f)
+            elif percent == 2:
+                f = float(data)  # 소수점 포함 처리
+                formatData = '{:-,.2f}'.format(f)
 
-        elif percent == 2:
-            f = float(data)
-            formatData = '{:-,.2f}'.format(f)
+            return formatData
 
-        return formatData
+        except (ValueError, TypeError) as e:
+            # 오류 발생 시 디버깅 메시지 출력 및 기본값 반환
+            print(f"Error in changeFormat: {data}, error: {e}")
+            return "0"
+        
 
+        
     def opwDataReset(self):
         """ 잔고 및 보유종목 데이터 초기화 """
         self.opw00001Data = 0
         self.opw00018Data = {'accountEvaluation': [], 'stocks': []}
+        self.opt20001Data = []
 
 
 class ParameterTypeError(Exception):
@@ -1388,3 +1487,6 @@ if __name__ == "__main__":
         print(e)
 
     sys.exit(app.exec_())
+
+
+
